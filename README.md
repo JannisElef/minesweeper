@@ -1,5 +1,5 @@
-# Template Pages Project
+# Minesweeper
 
-[website](https://janniselef.github.io/pages-project-template) · [more information](https://github.com/JannisElef/pages-project-template)
+[play the game](https://janniselef.github.io/minesweeper) · [more information](https://janniselef.github.io/games/minesweeper)
 
-This is a template for a project having an independent github-pages directory.
+Classic Minesweeper with a new theme - reveal the map but not the mines!
