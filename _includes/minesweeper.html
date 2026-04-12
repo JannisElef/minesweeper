@@ -1,6 +1,6 @@
 
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 /* ══ base ══════════════════════════════════════════════════════════ */
 *{margin:0;padding:0;box-sizing:border-box;}
@@ -68,7 +68,9 @@ h1{font-size:1.38rem;letter-spacing:.38em;color:var(--red);text-transform:upperc
                        0 0 20px 3px rgba(255,68,85,.18),
                        0 0 50px 8px rgba(68,136,255,.08),
                        0 0 80px 14px rgba(255,68,85,.06);
-            border-radius:2px;transition:box-shadow .4s;}
+            border-radius:2px;transition:box-shadow .4s;
+            will-change:transform;
+            transform-origin:center center;}
 #board-wrap.won{box-shadow:0 0 0 1px #252540,
                             0 0 24px 4px rgba(68,221,136,.4),
                             0 0 60px 10px rgba(68,221,136,.15);}
@@ -378,7 +380,11 @@ let particles=[];
 // Undo stack (flag actions only)
 let flagHistory=[];
 
+// Canonical (pre-swap) dimensions — always set from DIFFS or custom input
+let _baseROWS=16,_baseCOLS=16,_baseMINES=40;
 let ROWS=16,COLS=16,MINES=40;
+
+function setDims(r,c,m){_baseROWS=r;_baseCOLS=c;_baseMINES=m;ROWS=r;COLS=c;MINES=m;}
 let cells=[],minesPlaced=false,gameState='idle'; // idle | playing | won | dead
 let revealed=0,flagged=0;
 let timerVal=0,timerInterval=null;
@@ -402,22 +408,26 @@ let highscores=JSON.parse(localStorage.getItem('ms_hi2')||'[]');
 // ══════════════════════════════════════════════════════════════════
 function calcCellSize(){
   const vw=window.innerWidth,vh=window.innerHeight;
-  // On mobile portrait, swap wide boards to vertical
-  const isMobile=vw<=640;
-  const isPortrait=vh>vw;
-  if(isMobile&&isPortrait&&COLS>ROWS){[ROWS,COLS]=[COLS,ROWS];}
 
-  // Budget: leave room for title/hud/controls (~180px) + padding
-  const uiH=200;
+  // Measure actual non-canvas UI height so we don't guess
+  const boardWrap=document.getElementById('board-wrap');
+  let uiH=220; // fallback
+  if(boardWrap){
+    // everything above the board
+    const bTop=boardWrap.getBoundingClientRect().top+window.scrollY;
+    // everything below: controls ~80px
+    uiH=Math.max(160,bTop+90);
+  }
+
+  const isMobile=vw<=640;
   const maxW=vw>900 ? Math.min(1200,Math.floor(vw*0.86))
            : vw>640 ? Math.min(760, Math.floor(vw*0.92))
            :          Math.floor(vw*0.99);
-  const maxH=Math.max(100,vh-uiH);
+  const maxH=Math.max(80,vh-uiH);
 
   const byW=Math.floor(maxW/COLS);
   const byH=Math.floor(maxH/ROWS);
-  // Mobile: min 8px so large maps still render; desktop: min 16
-  const minCS=isMobile?8:16;
+  const minCS=isMobile?4:16;  // 4px minimum — any map will render
   const maxCS=isMobile?32:44;
   CS=Math.max(minCS,Math.min(maxCS,byW,byH));
 }
@@ -481,7 +491,12 @@ function forNeighbors(r,c,fn){
 function newGame(){
   clearInterval(timerInterval);timerInterval=null;timerVal=0;
   gameState='idle';
+  ROWS=_baseROWS;COLS=_baseCOLS;MINES=_baseMINES;
+  if(window.innerWidth<=640 && window.innerHeight>window.innerWidth && COLS>ROWS){
+    [ROWS,COLS]=[COLS,ROWS];
+  }
   initBoard();resizeCanvas();
+  if(typeof resetZoom==='function')resetZoom();
   updateHUD();setMsg('');
   document.getElementById('btn-face').textContent='🙂';
   document.getElementById('board-wrap').className='';
@@ -946,10 +961,56 @@ CNV.addEventListener('click',e=>{
 });
 
 // ══════════════════════════════════════════════════════════════════
-// INPUT — touch (long-press = flag, double-tap = chord)
+// TOUCH — pinch-zoom/pan + single-finger game controls
 // ══════════════════════════════════════════════════════════════════
+// Zoom state (CSS transform on board-wrap)
+let _zoom=1, _panX=0, _panY=0;
+let _pinchStartDist=0, _pinchStartZoom=1;
+let _pinchStartMidX=0, _pinchStartMidY=0;
+let _pinchStartPanX=0, _pinchStartPanY=0;
+let _isPinching=false;
+const ZOOM_MIN=1, ZOOM_MAX=6;
+const WRAP=document.getElementById('board-wrap');
+
+function applyTransform(){
+  // Clamp pan so board can't be dragged fully off-screen
+  const ww=window.innerWidth, wh=window.innerHeight;
+  const bw=CNV.width*_zoom, bh=CNV.height*_zoom;
+  const maxPX=Math.max(0,(bw-ww)*0.5+ww*0.1);
+  const maxPY=Math.max(0,(bh-wh)*0.5+wh*0.1);
+  _panX=Math.max(-maxPX,Math.min(maxPX,_panX));
+  _panY=Math.max(-maxPY,Math.min(maxPY,_panY));
+  WRAP.style.transform=`translate(${_panX}px,${_panY}px) scale(${_zoom})`;
+  WRAP.style.transformOrigin='center center';
+}
+function resetZoom(){
+  _zoom=1;_panX=0;_panY=0;applyTransform();
+}
+
+function getTouchDist(t1,t2){
+  return Math.hypot(t2.clientX-t1.clientX,t2.clientY-t1.clientY);
+}
+function getTouchMid(t1,t2){
+  return{x:(t1.clientX+t2.clientX)/2,y:(t1.clientY+t2.clientY)/2};
+}
+
 CNV.addEventListener('touchstart',e=>{
   e.preventDefault();
+  clearTimeout(longPressTimer);longPressTimer=null;
+
+  if(e.touches.length===2){
+    // Start pinch
+    _isPinching=true;
+    _pinchStartDist=getTouchDist(e.touches[0],e.touches[1]);
+    _pinchStartZoom=_zoom;
+    const mid=getTouchMid(e.touches[0],e.touches[1]);
+    _pinchStartMidX=mid.x;_pinchStartMidY=mid.y;
+    _pinchStartPanX=_panX;_pinchStartPanY=_panY;
+    return;
+  }
+
+  // Single finger — game action setup
+  _isPinching=false;
   const t=e.touches[0];
   const {r,c}=getCellXY(t.clientX,t.clientY);
   window._ambClick(t.clientX,t.clientY);
@@ -960,8 +1021,78 @@ CNV.addEventListener('touchstart',e=>{
   },500);
 },{passive:false});
 
+CNV.addEventListener('touchmove',e=>{
+  e.preventDefault();
+
+  if(e.touches.length===2){
+    _isPinching=true;
+    clearTimeout(longPressTimer);longPressTimer=null;
+    const dist=getTouchDist(e.touches[0],e.touches[1]);
+    const mid=getTouchMid(e.touches[0],e.touches[1]);
+    const newZoom=Math.max(ZOOM_MIN,Math.min(ZOOM_MAX,_pinchStartZoom*(dist/_pinchStartDist)));
+    // Translate pan so the midpoint stays fixed on screen
+    const scaleDelta=newZoom/_pinchStartZoom;
+    _zoom=newZoom;
+    _panX=_pinchStartPanX+(mid.x-_pinchStartMidX)+(mid.x-window.innerWidth/2)*(scaleDelta-1)*0;
+    _panY=_pinchStartPanY+(mid.y-_pinchStartMidY)+(mid.y-window.innerHeight/2)*(scaleDelta-1)*0;
+    applyTransform();
+    return;
+  }
+
+  // Single finger drag when zoomed — pan
+  if(_zoom>1.05 && e.touches.length===1 && touchStartTime){
+    clearTimeout(longPressTimer);longPressTimer=null;
+    const t=e.touches[0];
+    const startCell=touchStartCell||{r:-1,c:-1};
+    // treat as pan if moved more than a cell width
+    const {r,c}=getCellXY(t.clientX,t.clientY);
+    if(r!==startCell.r||c!==startCell.c){
+      // use touchmove delta for pan (store prev position)
+      if(e._lastX!==undefined){
+        _panX+=t.clientX-e._lastX;
+        _panY+=t.clientY-e._lastY;
+        applyTransform();
+      }
+    }
+  }
+},{passive:false});
+
+// Store prev touch position on the event for pan delta
+CNV.addEventListener('touchmove',e=>{
+  if(e.touches.length===1&&_zoom>1.05){
+    e._lastX=e.touches[0].clientX;
+    e._lastY=e.touches[0].clientY;
+  }
+},{passive:false});
+
+// Pan state for single-finger drag when zoomed
+let _prevTouchX=0,_prevTouchY=0,_touchMoved=false;
+CNV.addEventListener('touchmove',e=>{
+  e.preventDefault();
+  if(e.touches.length===1&&_zoom>1.05){
+    const t=e.touches[0];
+    if(_prevTouchX!==0){
+      _panX+=t.clientX-_prevTouchX;
+      _panY+=t.clientY-_prevTouchY;
+      applyTransform();
+      _touchMoved=true;
+      clearTimeout(longPressTimer);longPressTimer=null;
+    }
+    _prevTouchX=t.clientX;_prevTouchY=t.clientY;
+  }
+},{passive:false});
+
 CNV.addEventListener('touchend',e=>{
   e.preventDefault();
+  _prevTouchX=0;_prevTouchY=0;
+
+  if(_isPinching&&e.touches.length<2){
+    _isPinching=false;
+    return;
+  }
+  if(_isPinching){return;}
+  if(_touchMoved){_touchMoved=false;clearTimeout(longPressTimer);longPressTimer=null;return;}
+
   clearTimeout(longPressTimer);longPressTimer=null;
   const now=Date.now();
   const dt=now-touchStartTime;
@@ -978,6 +1109,18 @@ CNV.addEventListener('touchend',e=>{
     }
   }
 },{passive:false});
+
+// Double-tap zoom-out to reset
+let _lastDoubleTapT=0;
+CNV.addEventListener('touchend',e=>{
+  if(e.touches.length!==0)return;
+  const now=Date.now();
+  if(now-_lastDoubleTapT<300&&_zoom>1.5){resetZoom();}
+  _lastDoubleTapT=now;
+},{passive:false});
+
+// Reset zoom on new game is called inside newGame() above
+
 
 function getCell(e){
   const rect=CNV.getBoundingClientRect();
@@ -1062,20 +1205,20 @@ function renderHighscores(newTime){
 function onDiffChange(){
   const v=document.getElementById('diff-select').value;
   if(v==='custom'){openCG();return;}
-  const d=DIFFS[v];ROWS=d.rows;COLS=d.cols;MINES=d.mines;
+  const d=DIFFS[v];setDims(d.rows,d.cols,d.mines);
   newGame();
 }
 function openCG(){document.getElementById('cg-overlay').classList.add('open');}
 function closeCG(){
   document.getElementById('cg-overlay').classList.remove('open');
-  // revert select to previous valid diff if user cancelled
-  const cur=Object.keys(DIFFS).find(k=>DIFFS[k].rows===ROWS&&DIFFS[k].cols===COLS&&DIFFS[k].mines===MINES)||'medium';
+  const cur=Object.keys(DIFFS).find(k=>DIFFS[k].rows===_baseROWS&&DIFFS[k].cols===_baseCOLS&&DIFFS[k].mines===_baseMINES)||'medium';
   document.getElementById('diff-select').value=cur;
 }
 function startCustom(){
-  ROWS=Math.min(40,Math.max(5,+document.getElementById('cg-rows').value||16));
-  COLS=Math.min(60,Math.max(5,+document.getElementById('cg-cols').value||30));
-  MINES=Math.min(ROWS*COLS-9,Math.max(1,+document.getElementById('cg-mines').value||99));
+  const r=Math.min(40,Math.max(5,+document.getElementById('cg-rows').value||16));
+  const c=Math.min(60,Math.max(5,+document.getElementById('cg-cols').value||30));
+  const m=Math.min(r*c-9,Math.max(1,+document.getElementById('cg-mines').value||99));
+  setDims(r,c,m);
   document.getElementById('cg-overlay').classList.remove('open');
   newGame();
 }
@@ -1188,7 +1331,7 @@ document.getElementById('cb-anim').addEventListener('change',function(){optAnim=
 document.getElementById('cb-ambient').addEventListener('change',function(){window._setAmbient(this.checked);});
 
 // set difficulty from select default
-(()=>{const d=DIFFS['medium'];ROWS=d.rows;COLS=d.cols;MINES=d.mines;})();
+(()=>{const d=DIFFS['medium'];setDims(d.rows,d.cols,d.mines);})();
 newGame();
 renderHighscores(-1);
 </script>
